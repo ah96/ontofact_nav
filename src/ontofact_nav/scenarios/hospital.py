@@ -46,13 +46,6 @@ Scenarios
 
 from __future__ import annotations
 
-import sys
-import os
-
-# Allow running this script directly (python3 scenarios/hospital.py)
-# by adding the project root to the Python path.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-
 import math
 
 from ontofact_nav import (

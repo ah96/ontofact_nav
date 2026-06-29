@@ -14,6 +14,8 @@ from ontofact_nav import (
 """
 
 from .ontology      import Ontology, OntologyClass, OntologyIndividual
+from .config        import NavCostConfig
+from .classification import Classifier, DerivationRule, build_default_rules
 from .domain        import (
     AffordanceType, DoorState, SurfaceType, MobilityType,
     build_navigation_ontology,
@@ -32,6 +34,10 @@ __all__ = [
     "Ontology",
     "OntologyClass",
     "OntologyIndividual",
+    "NavCostConfig",
+    "Classifier",
+    "DerivationRule",
+    "build_default_rules",
     "AffordanceType",
     "DoorState",
     "SurfaceType",

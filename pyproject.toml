@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ontofact-nav"
+version = "0.1.0"
+description = "Ontology-guided counterfactual affordance reasoning for actionable robot navigation explanations"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Amar Halilovic", email = "amarhalilovic96@gmail.com" }]
+keywords = [
+    "robotics",
+    "navigation",
+    "explainable-ai",
+    "ontology",
+    "affordances",
+    "counterfactual",
+    "path-planning",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "networkx>=3.0",
+    "rdflib>=7.0",
+    "owlrl>=6.0",
+    "anthropic>=0.50.0",
+    "pydantic>=2.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "httpx>=0.24",
+]
+
+[project.scripts]
+ontofact-nav = "ontofact_nav.main:main"
+
+[project.urls]
+Homepage = "https://github.com/ah96/ontofact_nav"
+Repository = "https://github.com/ah96/ontofact_nav"
+Issues = "https://github.com/ah96/ontofact_nav/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# Module-level imports placed after code in scenario/demo files are intentional
+# (docstring-heavy headers); keep the rule set focused on real defects.
+ignore = ["E402"]

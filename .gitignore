@@ -1,0 +1,47 @@
+# Byte-compiled / optimized / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# Editable install / setuptools
+src/*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.cache/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+
+# Generated visualizations
+*.png
+!docs/**/*.png
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Environment / secrets
+.env

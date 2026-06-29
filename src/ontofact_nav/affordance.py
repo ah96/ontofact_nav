@@ -41,6 +41,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from pydantic import ConfigDict, field_validator
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
+from .classification import Classifier
+from .config import NavCostConfig
 from .domain import AffordanceType, DoorState, MobilityType, SurfaceType
 from .ontology import OntologyIndividual
 
@@ -64,12 +66,25 @@ class AffordanceRule:
     explanation_template : str — Python str.format template; may reference
                            {entity} (individual name) and any property key.
     priority             : int — reserved for future ordered evaluation
+    requires_class       : Optional[str] — if set, the rule only applies to
+                           individuals whose ontology class is, or descends
+                           from, this class name.  Lets a rule depend on the
+                           ontology hierarchy (e.g. "a Staircase is not
+                           climbable for wheeled robots") rather than on raw
+                           properties alone.  ``None`` ⇒ applies to every space.
+    requires_category    : Optional[str] — if set, the rule only applies to
+                           individuals that belong to this SPARQL-inferred
+                           category (see classification.py), e.g. "Steep" or
+                           "HighRiskZone".  Lets a rule depend on a numeric
+                           inference the ontology computes via SPARQL.
     """
     name:                 str
     affordance:           AffordanceType
     condition:            Callable[[Dict[str, Any], Dict[str, Any]], bool]
     explanation_template: str
     priority:             int = 0
+    requires_class:       Optional[str] = None
+    requires_category:    Optional[str] = None   # SPARQL-inferred category gate
 
     @field_validator("name")
     @classmethod
@@ -140,9 +155,18 @@ class AffordanceReasoner:
 
     Call ``add_grant()`` / ``add_block()`` to extend the rule set at runtime
     (e.g. to add domain-specific constraints without subclassing).
+
+    All numeric thresholds and the geometry/feasibility predicates come from an
+    injected :class:`NavCostConfig` (defaults reproduce historical behaviour),
+    so the rule conditions and the cost formula share one source of truth.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: Optional[NavCostConfig] = None) -> None:
+        self.config = config or NavCostConfig()
+        # SPARQL-driven numeric classifier (memoized).  Infers space categories
+        # such as "Steep" / "HighRiskZone" that gate the category-conditioned
+        # rules below — see classification.py.
+        self.classifier = Classifier(self.config)
         self.grant_rules: List[AffordanceRule] = []
         self.block_rules: List[AffordanceRule] = []
         self._register_default_rules()
@@ -170,13 +194,25 @@ class AffordanceReasoner:
         Rules are grouped by affordance type for readability.  Each group
         has one or more grant rules followed by one or more block rules.
 
+        Every geometric / threshold condition delegates to a ``NavCostConfig``
+        predicate (``cfg.fits_width`` etc.), so the rule engine and the cost
+        function evaluate the *same* formula — there is no second copy of the
+        passability logic to drift out of sync.
+
+        Hard barriers that used to be re-checked inside ``navigation_cost``
+        (locked / unopenable doors, over-steep slopes) are folded in here as
+        block rules on TRAVERSABLE / CLIMBABLE.  The cost function therefore
+        decides feasibility purely from the resulting affordance set.
+
         Rule naming convention: <action>_<affordance>_<condition_summary>
         """
+        cfg = self.config
 
         # ── TRAVERSABLE ────────────────────────────────────────────────────
-        # A space is traversable if it is accessible, non-hazardous, and not
-        # restricted.  All three flags must be true; any single false value
-        # blocks the affordance via a dedicated block rule.
+        # A space is traversable if it is accessible, non-hazardous, not
+        # restricted, AND not blocked by an impassable door (locked, or closed
+        # with no way for this robot to open it).  Any single failure mode is a
+        # dedicated block rule so the counterfactual engine sees a specific reason.
 
         self.grant_rules.append(AffordanceRule(
             name="traversable_if_accessible_and_safe",
@@ -191,8 +227,6 @@ class AffordanceReasoner:
             ),
         ))
 
-        # Three separate block rules (one per failure mode) so the blocking
-        # reason in AffordanceResult is specific enough to drive counterfactuals.
         self.block_rules.append(AffordanceRule(
             name="block_traversable_hazardous",
             affordance=AffordanceType.TRAVERSABLE,
@@ -211,20 +245,48 @@ class AffordanceReasoner:
             condition=lambda e, _a: not e.get("is_accessible", True),
             explanation_template="{entity} is marked not accessible",
         ))
+        # Door hard-barriers folded into TRAVERSABLE (single source of truth):
+        # a locked door is impassable; a closed door is impassable unless this
+        # robot can open it.  cfg.can_open_closed_door is the SAME predicate the
+        # OPENABLE grant rule uses, so the two cannot disagree.
+        self.block_rules.append(AffordanceRule(
+            name="block_traversable_door_locked",
+            affordance=AffordanceType.TRAVERSABLE,
+            condition=lambda e, _a: e.get("door_state") == DoorState.LOCKED.value,
+            explanation_template="{entity} door is locked — hard barrier, not traversable",
+        ))
+        self.block_rules.append(AffordanceRule(
+            name="block_traversable_door_closed_uncrossable",
+            affordance=AffordanceType.TRAVERSABLE,
+            condition=lambda e, a: (
+                e.get("door_state") == DoorState.CLOSED.value
+                and not cfg.can_open_closed_door(e, a)
+            ),
+            explanation_template="{entity} door is closed and robot cannot open it",
+        ))
+        # Combined-condition category (SPARQL-inferred): a "HighRiskZone" is
+        # crowded AND poorly lit — a conjunction the per-property rules don't
+        # express (crowd is a soft cost; low illumination only blocks OBSERVABLE).
+        # A robot without risk certification may not enter such a zone.
+        self.block_rules.append(AffordanceRule(
+            name="block_traversable_high_risk_uncertified",
+            affordance=AffordanceType.TRAVERSABLE,
+            requires_category="HighRiskZone",
+            condition=lambda e, a: not a.get("risk_certified", False),
+            explanation_template=(
+                "{entity} is a HighRiskZone (crowded + dark); "
+                "robot lacks risk certification"
+            ),
+        ))
 
         # ── PASSABLE ───────────────────────────────────────────────────────
-        # Depends on the robot's body dimensions relative to the space.
-        # Required width = robot_width + 2 × min_clearance (one buffer per side).
-        # Required height = robot_height.
+        # Robot body vs. space geometry.  Required width / height live in
+        # NavCostConfig (cfg.fits_width / cfg.fits_height).
 
         self.grant_rules.append(AffordanceRule(
             name="passable_if_wide_enough",
             affordance=AffordanceType.PASSABLE,
-            condition=lambda e, a: (
-                e.get("width",  10.0) >= a.get("robot_width", 0.5)
-                                        + 2 * a.get("min_clearance", 0.15)
-                and e.get("height", 3.0) >= a.get("robot_height", 1.5)
-            ),
+            condition=lambda e, a: cfg.fits_width(e, a) and cfg.fits_height(e, a),
             explanation_template=(
                 "{entity} width ≥ robot_width + 2×clearance; "
                 "height ≥ robot height"
@@ -233,10 +295,7 @@ class AffordanceReasoner:
         self.block_rules.append(AffordanceRule(
             name="block_passable_too_narrow",
             affordance=AffordanceType.PASSABLE,
-            condition=lambda e, a: (
-                e.get("width", 10.0) < a.get("robot_width", 0.5)
-                                      + 2 * a.get("min_clearance", 0.15)
-            ),
+            condition=lambda e, a: not cfg.fits_width(e, a),
             explanation_template=(
                 "{entity} width < robot_width + 2×min_clearance "
                 "(robot does not fit)"
@@ -245,26 +304,23 @@ class AffordanceReasoner:
         self.block_rules.append(AffordanceRule(
             name="block_passable_too_low",
             affordance=AffordanceType.PASSABLE,
-            condition=lambda e, a: (
-                e.get("height", 3.0) < a.get("robot_height", 1.5)
-            ),
+            condition=lambda e, a: not cfg.fits_height(e, a),
             explanation_template=(
                 "{entity} clearance < robot height (robot does not fit)"
             ),
         ))
 
         # ── CLIMBABLE ──────────────────────────────────────────────────────
-        # The slope angle of the space must be within the robot's drive-system
-        # limit (max_slope_angle).  An additional hard block prevents wheeled
-        # robots from climbing stair-like slopes (> 15°) even if max_slope_angle
-        # were set permissively, because wheels lose traction on steps.
+        # Slope within the robot's drive-system limit, plus a wheeled-on-stairs
+        # hard block.  Because flat spaces always satisfy slope_within_limit,
+        # CLIMBABLE is granted for every ordinary corridor — so "CLIMBABLE
+        # absent" is an exact signal that a steep-slope/stairs block fired, and
+        # the cost function can treat CLIMBABLE membership as the slope gate.
 
         self.grant_rules.append(AffordanceRule(
             name="climbable_slope_within_limit",
             affordance=AffordanceType.CLIMBABLE,
-            condition=lambda e, a: (
-                e.get("slope_angle", 0.0) <= a.get("max_slope_angle", 8.0)
-            ),
+            condition=lambda e, a: cfg.slope_within_limit(e, a),
             explanation_template=(
                 "{entity} slope ≤ agent max slope — within drive-system capability"
             ),
@@ -272,34 +328,50 @@ class AffordanceReasoner:
         self.block_rules.append(AffordanceRule(
             name="block_climbable_steep_slope",
             affordance=AffordanceType.CLIMBABLE,
-            condition=lambda e, a: (
-                e.get("slope_angle", 0.0) > a.get("max_slope_angle", 8.0)
-            ),
+            condition=lambda e, a: not cfg.slope_within_limit(e, a),
             explanation_template=(
                 "{entity} slope exceeds agent max_slope_angle — drive system limit"
             ),
         ))
-        # Wheeled robots fail on stair-like angles even if max_slope_angle is
-        # set high, because individual steps create vertical obstacles for wheels.
+        # Wheeled-on-stairs: the fixed stair-slope threshold is now inferred by
+        # SPARQL as the "Steep" category (classification.py), so the ONTOLOGY owns
+        # that numeric inference.  Equivalent to the old cfg.wheeled_on_stairs:
+        # Steep ⟺ slope > cfg.wheeled_stair_slope_limit (same injected constant);
+        # the mobility check stays Python (a string equality, not a numeric rule).
         self.block_rules.append(AffordanceRule(
-            name="block_climbable_wheeled_on_stairs",
+            name="block_climbable_steep_zone_wheeled",
             affordance=AffordanceType.CLIMBABLE,
+            requires_category="Steep",
             condition=lambda e, a: (
-                e.get("slope_angle", 0.0) > 15.0
-                and a.get("mobility_type", MobilityType.WHEELED.value)
-                   == MobilityType.WHEELED.value
+                a.get("mobility_type", MobilityType.WHEELED.value)
+                == MobilityType.WHEELED.value
             ),
             explanation_template=(
-                "Wheeled robot cannot climb stair-like slope > 15° in {entity}"
+                "{entity} is a Steep zone (slope > stair limit) — "
+                "wheeled robot cannot climb"
+            ),
+        ))
+        # Class-conditioned rule (the ontology is load-bearing here): a
+        # Staircase — by its CLASS, not merely its numeric slope — cannot be
+        # ascended by a wheeled robot.  Fires only for Staircase instances.
+        self.block_rules.append(AffordanceRule(
+            name="block_climbable_wheeled_on_staircase_class",
+            affordance=AffordanceType.CLIMBABLE,
+            requires_class="Staircase",
+            condition=lambda e, a: (
+                a.get("mobility_type", MobilityType.WHEELED.value)
+                == MobilityType.WHEELED.value
+            ),
+            explanation_template=(
+                "{entity} is a Staircase — a wheeled robot cannot ascend steps"
             ),
         ))
 
         # ── OPENABLE ───────────────────────────────────────────────────────
         # OPENABLE is ONLY relevant for spaces that explicitly carry a
-        # 'door_state' property set to CLOSED or LOCKED.  Corridors without
-        # a door are unaffected.  This avoids spurious "openable blocked"
-        # warnings for every doorless corridor (a common false-positive in
-        # naive implementations).
+        # 'door_state' of CLOSED or LOCKED.  Doorless corridors are unaffected.
+        # It drives the door-opening soft cost (not feasibility — feasibility is
+        # handled by the TRAVERSABLE door blocks above).
 
         def _has_closed_or_locked_door(e: dict) -> bool:
             """True only when the space has an explicit, non-open door."""
@@ -310,11 +382,10 @@ class AffordanceReasoner:
         self.grant_rules.append(AffordanceRule(
             name="openable_if_can_open_and_not_locked",
             affordance=AffordanceType.OPENABLE,
-            condition=lambda e, a: (
-                _has_closed_or_locked_door(e)                   # only if a door exists
-                and a.get("can_open_doors", False)              # robot has capability
-                and e.get("door_state") != DoorState.LOCKED.value  # door is not locked
-            ),
+            # cfg.can_open_closed_door encodes "door is CLOSED (not locked) and
+            # robot can_open_doors" — the same predicate the TRAVERSABLE door
+            # block negates, guaranteeing the two stay consistent.
+            condition=lambda e, a: cfg.can_open_closed_door(e, a),
             explanation_template=(
                 "Robot can open doors and {entity} door is closed (not locked)"
             ),
@@ -341,33 +412,31 @@ class AffordanceReasoner:
         ))
 
         # ── OBSERVABLE ─────────────────────────────────────────────────────
-        # Low illumination degrades sensor reliability (cameras, LiDAR in
-        # dusty/dark conditions).  Threshold 0.25 is a design choice — below
-        # this the robot cannot localise with sufficient confidence.
-        # OBSERVABLE does not hard-block traversal; it adds a cost penalty (1.8)
-        # to account for slower, more cautious navigation under uncertainty.
+        # Low illumination degrades sensor reliability.  Threshold lives in
+        # cfg.observable_threshold; below it the robot cannot localise reliably.
+        # OBSERVABLE does not hard-block traversal — it adds a cost penalty.
 
         self.grant_rules.append(AffordanceRule(
             name="observable_if_lit",
             affordance=AffordanceType.OBSERVABLE,
-            condition=lambda e, _a: e.get("illumination", 1.0) > 0.25,
+            condition=lambda e, _a: cfg.lit_enough(e),
             explanation_template=(
-                "{entity} illumination > 0.25 — sufficient for reliable sensing"
+                "{entity} illumination above threshold — sufficient for reliable sensing"
             ),
         ))
         self.block_rules.append(AffordanceRule(
             name="block_observable_dark",
             affordance=AffordanceType.OBSERVABLE,
-            condition=lambda e, _a: e.get("illumination", 1.0) <= 0.25,
+            condition=lambda e, _a: not cfg.lit_enough(e),
             explanation_template=(
-                "{entity} too dark (illumination ≤ 0.25) — localisation uncertainty"
+                "{entity} too dark — localisation uncertainty"
             ),
         ))
 
         # ── AVOIDABLE ──────────────────────────────────────────────────────
         # Any space can in principle be excluded from the plan by routing
-        # around it.  This affordance is always granted and never blocked —
-        # it exists so the explanation layer can describe avoidance decisions.
+        # around it.  Always granted, never blocked — it exists so the
+        # explanation layer can describe avoidance decisions.
 
         self.grant_rules.append(AffordanceRule(
             name="always_avoidable",
@@ -380,6 +449,28 @@ class AffordanceReasoner:
     # Core inference
     # ------------------------------------------------------------------
 
+    def _entity_view(self, entity: OntologyIndividual) -> Dict[str, Any]:
+        """
+        The property dict a rule actually sees: explicit instance properties
+        layered on top of inherited class-level defaults (instance wins).
+
+        This is where the ontology class hierarchy becomes load-bearing for
+        inference — a space that omits a property picks up its class's default,
+        so two individuals with identical *explicit* properties but different
+        *classes* can yield different affordances.
+        """
+        merged: Dict[str, Any] = {}
+        # Walk root → leaf so a subclass default overrides its ancestor's.
+        chain: List = []
+        node = entity.ont_class
+        while node is not None:
+            chain.append(node)
+            node = node.parent
+        for node in reversed(chain):
+            merged.update(node.defaults)
+        merged.update(entity.properties)   # explicit instance values win
+        return merged
+
     def compute(
         self,
         entity: OntologyIndividual,
@@ -390,9 +481,16 @@ class AffordanceReasoner:
 
         Algorithm
         ---------
-        1. Evaluate every grant-rule; collect (affordance → explanation) for fires.
-        2. Evaluate every block-rule; collect (affordance → reason) for fires.
-        3. Net = granted.keys() − blocked.keys()
+        1. Build the class-aware entity view (instance props over class defaults).
+        2. Evaluate every grant-rule; collect (affordance → explanation) for fires.
+        3. Evaluate every block-rule; collect (affordance → reason) for fires.
+        4. Net = granted.keys() − blocked.keys()
+
+        A rule with ``requires_class`` set is skipped unless the entity's
+        ontology class is, or descends from, that class.  A rule with
+        ``requires_category`` set is skipped unless the entity belongs to that
+        SPARQL-inferred category.  So rule applicability consults both the
+        ontology hierarchy and the SPARQL numeric classification.
 
         Edge cases
         ----------
@@ -400,14 +498,28 @@ class AffordanceReasoner:
           we catch the exception and fall back to a partial format.  This keeps
           the engine robust against incomplete ontology individuals.
         """
-        e = entity.properties
+        e = self._entity_view(entity)
         a = agent.properties
+
+        # SPARQL-inferred numeric categories for this space (memoized).  Computed
+        # from the class-aware property view, so counterfactual clones with
+        # mutated properties reclassify correctly.
+        cats = self.classifier.derived_categories(e, a)
 
         granted: Dict[AffordanceType, str] = {}
         blocked: Dict[AffordanceType, str] = {}
 
+        def _applies(rule: AffordanceRule) -> bool:
+            if rule.requires_class is not None and not entity.is_instance_of_name(rule.requires_class):
+                return False
+            if rule.requires_category is not None and rule.requires_category not in cats:
+                return False
+            return True
+
         # Evaluate grant rules
         for rule in self.grant_rules:
+            if not _applies(rule):
+                continue
             try:
                 if rule.condition(e, a):
                     # Merge entity and agent props for template interpolation.
@@ -425,6 +537,8 @@ class AffordanceReasoner:
 
         # Evaluate block rules
         for rule in self.block_rules:
+            if not _applies(rule):
+                continue
             try:
                 if rule.condition(e, a):
                     reason = rule.explanation_template.format(
@@ -451,17 +565,15 @@ class AffordanceReasoner:
     # Cost derivation
     # ------------------------------------------------------------------
 
-    # Surface friction cost adders (in cost-distance units added to edge length)
-    # Calibrated so that a WET floor adds ~14% overhead over a 10 m corridor.
-    _SURFACE_COST: Dict[str, float] = {
-        SurfaceType.SMOOTH.value:   0.0,
-        SurfaceType.TILED.value:    0.0,
-        SurfaceType.CARPETED.value: 0.3,
-        SurfaceType.ROUGH.value:    0.6,
-        SurfaceType.WET.value:      1.4,   # slip risk → extra caution → slower
-        SurfaceType.GRAVEL.value:   0.9,
-        SurfaceType.GRASS.value:    0.7,
-    }
+    # Affordances every passable edge must have.  Door and slope hard-barriers
+    # are folded into these (see _register_default_rules), so feasibility is a
+    # single membership test — the cost function never re-reads raw properties
+    # to make a feasibility decision.
+    _HARD_REQUIRED = (
+        AffordanceType.TRAVERSABLE,
+        AffordanceType.PASSABLE,
+        AffordanceType.CLIMBABLE,
+    )
 
     def navigation_cost(
         self,
@@ -475,73 +587,64 @@ class AffordanceReasoner:
         Returns ``(cost, AffordanceResult)``.
         ``cost == math.inf`` means the edge is impassable for this agent.
 
-        Cost formula
-        ------------
-        cost = base_distance                    (Euclidean metres)
-             + door_opening_penalty             (2.5 if closed but openable)
-             + surface_friction                 (0.0–1.4)
-             + crowd_density  × 4.0             (high weight: safety concern)
-             + obstacle_density × 2.5
-             + visibility_penalty               (1.8 if OBSERVABLE missing)
-             + slope_angle × 0.06               (gentle gradient cost)
-             × emergency_discount               (× 0.75 for preferred routes)
+        Passability contract (single source of truth)
+        ----------------------------------------------
+        An edge is impassable **iff** the net affordance set is missing one of
+        ``{TRAVERSABLE, PASSABLE, CLIMBABLE}``.  Every former raw-property
+        hard-block (locked / unopenable door, over-steep slope, wheeled-on-
+        stairs) is now a block rule that removes one of these affordances, so
+        this function makes no independent feasibility decision — it only adds
+        soft penalties below the gate.  ``door_state``/``slope`` are read here
+        purely as *cost inputs*, never to decide feasibility.
 
-        The multiplier of 4.0 for crowd is intentionally high — navigating
-        through dense crowds is both slow and risky for the robot.
+        Soft cost formula (all weights from NavCostConfig)
+        --------------------------------------------------
+        cost = base_distance
+             + door_opening_penalty   (if door CLOSED and OPENABLE present)
+             + surface_friction
+             + crowd_density   × crowd_cost_weight
+             + obstacle_density × obstacle_cost_weight
+             + visibility_penalty     (if OBSERVABLE missing)
+             + slope_angle × slope_cost_coeff
+             × emergency_discount     (if emergency_route)
         """
         result = self.compute(entity, agent)
-        af = set(result.affordances)
-        e  = entity.properties
-        a  = agent.properties
+        af  = set(result.affordances)
+        cfg = self.config
 
-        # ── Hard blockers → impassable ──────────────────────────────────────
-        # TRAVERSABLE missing: space is hazardous, restricted, or inaccessible.
-        if AffordanceType.TRAVERSABLE not in af:
+        # ── SINGLE hard-block gate: feasibility read ONLY from the affordances ──
+        if any(req not in af for req in self._HARD_REQUIRED):
             return math.inf, result
 
-        # PASSABLE missing: robot body does not fit.
-        if AffordanceType.PASSABLE not in af:
-            return math.inf, result
-
-        # Door check: locked is always impassable; closed requires OPENABLE.
-        door_state = e.get("door_state", DoorState.OPEN.value)
-        if door_state == DoorState.LOCKED.value:
-            return math.inf, result
-        if door_state == DoorState.CLOSED.value and AffordanceType.OPENABLE not in af:
-            return math.inf, result
-
-        # Slope check: if slope exceeds limit, CLIMBABLE will be absent.
-        slope = e.get("slope_angle", 0.0)
-        if slope > a.get("max_slope_angle", 8.0):
-            if AffordanceType.CLIMBABLE not in af:
-                return math.inf, result
-
-        # ── Soft cost contributions ─────────────────────────────────────────
+        # ── Soft costs only below this line (class-aware property view) ─────────
+        e    = self._entity_view(entity)
         cost = base_distance
 
         # Door-opening adds time cost (robot must stop, engage manipulator)
+        door_state = e.get("door_state", DoorState.OPEN.value)
         if door_state == DoorState.CLOSED.value and AffordanceType.OPENABLE in af:
-            cost += 2.5
+            cost += cfg.door_opening_penalty
 
         # Surface friction (material resistance / slip precaution)
         surface = e.get("surface_type", SurfaceType.SMOOTH.value)
-        cost += self._SURFACE_COST.get(surface, 0.0)
+        cost += cfg.surface_cost.get(surface, 0.0)
 
         # Crowd — high weight because crowds slow the robot significantly
-        cost += e.get("crowd_density",    0.0) * 4.0
+        cost += e.get("crowd_density",    cfg.default_crowd_density)    * cfg.crowd_cost_weight
         # Obstacles — moderate weight (robot can weave around scattered obstacles)
-        cost += e.get("obstacle_density", 0.0) * 2.5
+        cost += e.get("obstacle_density", cfg.default_obstacle_density) * cfg.obstacle_cost_weight
 
         # Low visibility adds a navigation-uncertainty penalty
         if AffordanceType.OBSERVABLE not in af:
-            cost += 1.8
+            cost += cfg.visibility_penalty
 
         # Gradual slope adds mild extra cost (motor load)
+        slope = e.get("slope_angle", cfg.default_slope_angle)
         if slope > 0.0:
-            cost += slope * 0.06
+            cost += slope * cfg.slope_cost_coeff
 
-        # Emergency-designated routes are preferred — 25% discount
+        # Emergency-designated routes are preferred
         if e.get("emergency_route", False):
-            cost *= 0.75
+            cost *= cfg.emergency_discount
 
-        return max(cost, 0.01), result   # guard against zero-cost edges
+        return max(cost, cfg.cost_floor), result   # guard against zero-cost edges

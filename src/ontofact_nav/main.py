@@ -25,7 +25,9 @@ The warehouse scenario demonstrates:
   • slope-angle blocking (18° ramp: wheeled blocked, tracked allowed)
   • width-based aisle restriction (1.4 m forklift cannot use 0.85 m narrow aisle)
 
-No external dependencies — requires only Python 3.8+ stdlib.
+Equivalent entry points:
+  python -m ontofact_nav [hospital|warehouse]
+  ontofact-nav          [hospital|warehouse]   (installed console script)
 """
 
 import sys

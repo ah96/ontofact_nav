@@ -516,15 +516,22 @@ class AStarPlanner:
         Used by the counterfactual engine to evaluate user-specified
         alternative paths ("Why not go via room_b → room_c?").
 
-        Returns NavPath.infeasible() if any edge in the sequence is missing
-        from the graph or has infinite cost in the current world.
+        Returns NavPath.infeasible() only if the sequence is disconnected (some
+        consecutive pair has no edge in the graph).  If every pair is connected
+        but one or more edges are impassable, the returned NavPath carries the
+        FULL ordered edge list with ``total_cost = inf`` and ``is_feasible =
+        False``.  Keeping every edge (rather than truncating at the first
+        impassable one) is essential for the counterfactual engine: it must see
+        *all* blockers on the alternative and re-cost the *whole* path under
+        hypothetical changes, not just the prefix up to the first blocker.
         """
         if len(node_sequence) < 2:
             return NavPath(node_sequence, [], 0.0, [], True)
 
-        edges: List[NavEdge]          = []
-        afs:   List[AffordanceResult] = []
-        total  = 0.0
+        edges:    List[NavEdge]          = []
+        afs:      List[AffordanceResult] = []
+        total     = 0.0
+        feasible  = True
 
         for i in range(len(node_sequence) - 1):
             fid, tid = node_sequence[i], node_sequence[i + 1]
@@ -532,31 +539,24 @@ class AStarPlanner:
             # Find the first matching edge (there should be exactly one)
             matches = [e for e in self.graph.neighbors(fid) if e.to_id == tid]
             if not matches:
-                return NavPath.infeasible()   # no edge between these nodes
+                return NavPath.infeasible()   # genuinely disconnected sequence
 
             edge = matches[0]
             cost, af = self.reasoner.navigation_cost(
                 edge.space_individual, agent, base_distance=edge.distance
             )
-
-            if cost == math.inf:
-                # Sequence is infeasible at this edge; return partial info
-                return NavPath(
-                    nodes              = node_sequence,
-                    edges              = edges + [edge],
-                    total_cost         = math.inf,
-                    affordance_results = afs + [af],
-                    is_feasible        = False,
-                )
-
-            total += cost
             edges.append(edge)
             afs.append(af)
+
+            if cost == math.inf:
+                feasible = False              # record, but keep collecting edges
+            else:
+                total += cost
 
         return NavPath(
             nodes              = node_sequence,
             edges              = edges,
-            total_cost         = total,
+            total_cost         = total if feasible else math.inf,
             affordance_results = afs,
-            is_feasible        = True,
+            is_feasible        = feasible,
         )

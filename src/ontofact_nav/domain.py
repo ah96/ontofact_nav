@@ -177,8 +177,14 @@ def build_navigation_ontology() -> Ontology:
                   description="General-purpose enclosed room")
     onto.defclass("Corridor",  parent_name="IndoorSpace",
                   description="Narrow linear passage connecting spaces")
+    # Class-level defaults make the ontology load-bearing: a Staircase
+    # individual that omits 'slope_angle' inherits a stair-like 30° (and a rough
+    # tread surface), so it is intrinsically non-climbable for ordinary wheeled
+    # robots even when created with the same explicit properties as a Corridor.
     onto.defclass("Staircase", parent_name="IndoorSpace",
-                  description="Stepped passage between floors")
+                  description="Stepped passage between floors",
+                  defaults={"slope_angle": 30.0,
+                            "surface_type": SurfaceType.ROUGH.value})
     onto.defclass("Elevator",  parent_name="IndoorSpace",
                   description="Mechanical vertical transport unit")
     onto.defclass("Doorway",   parent_name="IndoorSpace",
@@ -263,6 +269,9 @@ def build_navigation_ontology() -> Ontology:
         # Manipulation capabilities — used by OPENABLE rule
         ("can_open_doors",  bool,  "Whether robot can open closed (unlocked) doors"),
         ("has_arm",         bool,  "Whether robot has a manipulation arm"),
+
+        # Certification — permits entry to an inferred HighRiskZone (crowded+dark)
+        ("risk_certified",  bool,  "Whether robot is certified for high-risk zones"),
 
         # Operational status (available for extension; not used in current rules)
         ("battery_level",   float, "Current battery charge [0, 1]"),

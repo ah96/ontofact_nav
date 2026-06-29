@@ -132,10 +132,12 @@ def _build_demo_scenario() -> None:
 
 def _build_hospital_scenario() -> None:
     """Load the full hospital scenario (ONTOFACT_SCENARIO=hospital)."""
-    from ontofact_nav.scenarios.hospital import run as _run
-    # hospital.run() prints to stdout; we re-use its graph-building logic by
-    # importing the module and calling the internal builder.
-    _build_demo_scenario()   # fallback — hospital internals are not easily importable
+    from ontofact_nav.scenarios.hospital import build_hospital_world
+    onto, graph, agents = build_hospital_world()
+    _state["onto"]      = onto
+    _state["graph"]     = graph
+    _state["navigator"] = OntofactNavigator(onto, graph)
+    _state["agents"]    = agents
 
 
 @app.on_event("startup")
@@ -210,8 +212,8 @@ class NavigateResponse(BaseModel):
 class WhyNotResponse(BaseModel):
     query:        str
     changes:      List[CounterfactualChange]
-    cf_cost:      Optional[float]
-    cost_delta:   float
+    cf_cost:      Optional[float]   # None = alternative infeasible even after changes
+    cost_delta:   Optional[float]   # None = unbounded (e.g. actual path infeasible)
     is_achievable: bool
     explanation:  str
 
@@ -318,8 +320,8 @@ def why_not(
     return WhyNotResponse(
         query         = cf.query,
         changes       = changes,
-        cf_cost       = None if cf.cf_cost == math.inf else round(cf.cf_cost, 3),
-        cost_delta    = round(cf.cost_delta, 3),
+        cf_cost       = round(cf.cf_cost, 3) if math.isfinite(cf.cf_cost) else None,
+        cost_delta    = round(cf.cost_delta, 3) if math.isfinite(cf.cost_delta) else None,
         is_achievable = cf.is_achievable,
         explanation   = cf.explanation,
     )

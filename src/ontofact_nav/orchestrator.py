@@ -34,6 +34,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from .affordance import AffordanceReasoner
+from .config import NavCostConfig
 from .counterfactual import Counterfactual, CounterfactualEngine
 from .explanation import ExplanationGenerator, NavigationExplanation
 from .navigation import AStarPlanner, NavPath, NavigationGraph
@@ -57,23 +58,28 @@ class OntofactNavigator:
 
     def __init__(
         self,
-        onto:  Ontology,
-        graph: NavigationGraph,
+        onto:   Ontology,
+        graph:  NavigationGraph,
+        config: Optional[NavCostConfig] = None,
     ) -> None:
-        self.onto  = onto
-        self.graph = graph
+        self.onto   = onto
+        self.graph  = graph
+        # One shared numeric policy for the whole stack — the reasoner and the
+        # counterfactual engine both receive it, so thresholds cannot diverge.
+        self.config = config or NavCostConfig()
 
         # Construct subsystems in dependency order:
         #   1. AffordanceReasoner — no dependencies
         #   2. AStarPlanner       — depends on graph + reasoner
         #   3. CounterfactualEngine — depends on reasoner + planner + onto.individuals
         #   4. ExplanationGenerator — no planner dependency (pure formatting)
-        self.reasoner  = AffordanceReasoner()
+        self.reasoner  = AffordanceReasoner(config=self.config)
         self.planner   = AStarPlanner(graph, self.reasoner)
         self.cf_engine = CounterfactualEngine(
             reasoner         = self.reasoner,
             planner          = self.planner,
             onto_individuals = onto.individuals,  # live reference — reflects mutations
+            config           = self.config,
         )
         self.explainer = ExplanationGenerator()
 
